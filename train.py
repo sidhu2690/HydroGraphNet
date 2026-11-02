@@ -25,12 +25,8 @@ import yaml
 
 from evaluate import evaluate_dataset
 from hydrographnet.dataset import HydroGraphDataset
-from hydrographnet.graph import GraphBatch, collate_graphs
-from hydrographnet.losses import (
-    compute_depth_volume_penalty,
-    compute_physics_loss,
-    compute_prediction_loss,
-)
+from hydrographnet.graph import collate_graphs
+from hydrographnet.losses import compute_prediction_loss
 from hydrographnet.models import HydroGraphNet
 
 
@@ -69,172 +65,8 @@ def setup_distributed(device_pref: str = "auto") -> Tuple[torch.device, int, int
     return device, 0, 1, False
 
 
-def forward_backward_step(
-    model: nn.Module,
-    graph: GraphBatch,
-    physics_data: Optional[Dict[str, torch.Tensor]],
-    cfg: dict,
-    use_amp: bool = False,
-    amp_dtype: torch.dtype = torch.bfloat16,
-    scaler: Optional[GradScaler] = None,
-    is_ddp: bool = False,
-) -> Dict[str, float]:
-    """Memory-optimal forward + backward pass.
-
-    In ``pushforward`` mode, backpropagates the teacher-forced + physics branch first
-    (under ``model.no_sync()`` when using DDP) so its activation graph is freed before
-    evaluating the stability branch — yielding identical gradients at half the peak memory.
-    """
-    noise_type = cfg.get("noise_type", "pushforward")
-    K = int(cfg.get("n_time_steps", 2))
-    use_phys = bool(cfg.get("use_physics_loss", True)) and physics_data is not None
-    use_pen = bool(cfg.get("use_penalty_loss", True)) and physics_data is not None
-    phys_w = float(cfg.get("physics_loss_weight", 1.0))
-    pen_w = float(cfg.get("penalty_loss_weight", 0.1))
-    stab_w = float(cfg.get("stability_loss_weight", 1.0))
-    delta_t = float(cfg.get("delta_t", 1200.0))
-
-    X = graph.x
-    assert graph.y is not None
-
-    def _bwd(loss_tensor: torch.Tensor) -> None:
-        if scaler is not None and scaler.is_enabled():
-            scaler.scale(loss_tensor).backward()
-        else:
-            loss_tensor.backward()
-
-    def _amp():
-        return autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
-
-    if noise_type == "pushforward":
-        assert physics_data is not None, "pushforward requires physics_data dict"
-        terrain = X[:, :10]
-        forcing_step1 = X[:, 10:12]
-        wd_full = X[:, 12 : 12 + (K + 1)]
-        vol_full = X[:, 12 + (K + 1) : 12 + 2 * (K + 1)]
-
-        forcing_step2 = torch.stack(
-            [
-                physics_data["step2_inflow_norm"][graph.batch],
-                physics_data["step2_precip_norm"][graph.batch],
-            ],
-            dim=1,
-        )
-
-        # 1) Detached Step-1 rollout: s1 -> s2_hat
-        with torch.no_grad(), _amp():
-            x_step1 = torch.cat([terrain, forcing_step1, wd_full[:, :K], vol_full[:, :K]], dim=1)
-            pred_step1 = model(x_step1, graph.edge_attr, graph)
-            wd_s2_hat = wd_full[:, K - 1 : K] + pred_step1[:, 0:1]
-            vol_s2_hat = vol_full[:, K - 1 : K] + pred_step1[:, 1:2]
-
-        # 2a) Clean teacher-forced Step-2 branch + physics + penalty (freed immediately on backward)
-        sync_ctx = model.no_sync() if (is_ddp and hasattr(model, "no_sync") and stab_w > 0) else nullcontext()
-        with sync_ctx:
-            with _amp():
-                x_one = torch.cat([terrain, forcing_step2, wd_full[:, 1 : K + 1], vol_full[:, 1 : K + 1]], dim=1)
-                pred_one = model(x_one, graph.edge_attr, graph)
-                loss_one = compute_prediction_loss(pred_one, graph.y)["pred_loss"]
-                branch_a_loss = loss_one
-
-                l_phys_val = 0.0
-                if use_phys:
-                    l_phys = compute_physics_loss(pred_one, physics_data, graph, delta_t=delta_t)
-                    branch_a_loss = branch_a_loss + phys_w * l_phys
-                    l_phys_val = float(l_phys.detach().item())
-
-                l_pen_val = 0.0
-                if use_pen and graph.area_denorm is not None:
-                    l_pen = compute_depth_volume_penalty(
-                        pred=pred_one,
-                        prev_wd_norm=wd_full[:, K],
-                        prev_vol_norm=vol_full[:, K],
-                        area_denorm=graph.area_denorm,
-                        wd_mean=float(physics_data["wd_mean"][0].item()),
-                        wd_std=float(physics_data["wd_std"][0].item()),
-                        vol_mean=float(physics_data["volume_mean"][0].item()),
-                        vol_std=float(physics_data["volume_std"][0].item()),
-                    )
-                    branch_a_loss = branch_a_loss + pen_w * l_pen
-                    l_pen_val = float(l_pen.detach().item())
-
-                loss_one_val = float(loss_one.detach().item())
-                branch_a_val = float(branch_a_loss.detach().item())
-
-            _bwd(branch_a_loss)
-            del pred_one, loss_one, branch_a_loss
-
-        # 2b) Pushforward stability branch (Eq. 28): s2_hat -> s2+1
-        loss_stab_val = 0.0
-        if stab_w > 0:
-            with _amp():
-                wd_stab = torch.cat([wd_full[:, 1:K], wd_s2_hat], dim=1)
-                vol_stab = torch.cat([vol_full[:, 1:K], vol_s2_hat], dim=1)
-                x_stab = torch.cat([terrain, forcing_step2, wd_stab, vol_stab], dim=1)
-                pred_stab = model(x_stab, graph.edge_attr, graph)
-                target_stab = torch.cat(
-                    [
-                        (wd_full[:, K : K + 1] + graph.y[:, 0:1]) - wd_s2_hat,
-                        (vol_full[:, K : K + 1] + graph.y[:, 1:2]) - vol_s2_hat,
-                    ],
-                    dim=1,
-                )
-                loss_stab = compute_prediction_loss(pred_stab, target_stab)["pred_loss"]
-                loss_stab_val = float(loss_stab.detach().item())
-                branch_b_loss = stab_w * loss_stab
-            _bwd(branch_b_loss)
-            del pred_stab, loss_stab, branch_b_loss
-
-        return {
-            "loss_one": loss_one_val,
-            "loss_stability": loss_stab_val,
-            "physics_loss": l_phys_val,
-            "penalty_loss": l_pen_val,
-            "total_loss": branch_a_val + stab_w * loss_stab_val,
-        }
-
-    # Standard 1-step mode
-    with _amp():
-        pred = model(X, graph.edge_attr, graph)
-        loss_one = compute_prediction_loss(pred, graph.y)["pred_loss"]
-        total_loss = loss_one
-
-        l_phys_val = 0.0
-        if use_phys and physics_data is not None:
-            l_phys = compute_physics_loss(pred, physics_data, graph, delta_t=delta_t)
-            total_loss = total_loss + phys_w * l_phys
-            l_phys_val = float(l_phys.detach().item())
-
-        l_pen_val = 0.0
-        if use_pen and physics_data is not None and graph.area_denorm is not None:
-            l_pen = compute_depth_volume_penalty(
-                pred=pred,
-                prev_wd_norm=X[:, 12 + K - 1],
-                prev_vol_norm=X[:, 12 + 2 * K - 1],
-                area_denorm=graph.area_denorm,
-                wd_mean=float(physics_data["wd_mean"][0].item()),
-                wd_std=float(physics_data["wd_std"][0].item()),
-                vol_mean=float(physics_data["volume_mean"][0].item()),
-                vol_std=float(physics_data["volume_std"][0].item()),
-            )
-            total_loss = total_loss + pen_w * l_pen
-            l_pen_val = float(l_pen.detach().item())
-
-        loss_one_val = float(loss_one.detach().item())
-        total_val = float(total_loss.detach().item())
-
-    _bwd(total_loss)
-    return {
-        "loss_one": loss_one_val,
-        "loss_stability": 0.0,
-        "physics_loss": l_phys_val,
-        "penalty_loss": l_pen_val,
-        "total_loss": total_val,
-    }
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train KAN-free HydroGraphNet (MLP-MeshGraphNet).")
+    parser = argparse.ArgumentParser(description="Train KAN-free HydroGraphNet (Pure L_pred MLP-MeshGraphNet).")
     parser.add_argument("--config", type=Path, default=Path("configs/config.yaml"))
     parser.add_argument("--resume", action="store_true", help="Resume from <ckpt_dir>/latest.pt if present.")
     args = parser.parse_args()
@@ -245,10 +77,6 @@ def main() -> None:
     device, rank, world_size, is_ddp = setup_distributed(cfg.get("device", "auto"))
     is_main = rank == 0
 
-    need_phys = bool(cfg.get("use_physics_loss", True)) or bool(cfg.get("use_penalty_loss", True)) or (
-        cfg.get("noise_type", "pushforward") == "pushforward"
-    )
-
     train_ds = HydroGraphDataset(
         data_dir=cfg["data_dir"],
         prefix=cfg.get("prefix", "M80"),
@@ -256,10 +84,9 @@ def main() -> None:
         n_time_steps=cfg.get("n_time_steps", 2),
         k=cfg.get("k_neighbors", 4),
         noise_std=float(cfg.get("noise_std", 0.01)),
-        noise_type=cfg.get("noise_type", "pushforward"),
+        noise_type=cfg.get("noise_type", "random_walk"),
         hydrograph_ids_file=cfg.get("train_ids_file", "train.txt"),
         split="train",
-        return_physics=need_phys,
         skip=cfg.get("skip_initial_steps", 72),
     )
 
@@ -275,14 +102,14 @@ def main() -> None:
             k=cfg.get("k_neighbors", 4),
             hydrograph_ids_file=cfg.get("test_ids_file", "test.txt"),
             split="test",
-            rollout_length=int(cfg.get("num_test_time_steps", 30)),
+            rollout_length=int(cfg.get("num_test_time_steps", 60)),
             skip=cfg.get("skip_initial_steps", 72),
         )
 
     sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
     loader = DataLoader(
         train_ds,
-        batch_size=int(cfg.get("batch_size", 4)),
+        batch_size=int(cfg.get("batch_size", 8)),
         shuffle=(sampler is None),
         sampler=sampler,
         num_workers=int(cfg.get("num_workers", 0)),
@@ -296,9 +123,9 @@ def main() -> None:
 
     if is_main:
         print("=" * 72)
-        print("KAN-Free HydroGraphNet (Pure MLP Encoder-Processor-Decoder MeshGraphNet)")
+        print("KAN-Free HydroGraphNet (Pure MLP-MeshGraphNet | Pure L_pred Objective)")
         print(f"  Device           : {device} (world_size={world_size})")
-        print(f"  Trainable params : {n_params:,} (0 KAN harmonics / 0 spline layers)")
+        print(f"  Trainable params : {n_params:,} (0 KAN harmonics | 0 auxiliary loss terms)")
         print(f"  Mesh topology    : {train_ds.num_nodes:,} nodes | {train_ds._edge_index_t.shape[1]:,} directed edges")
         print(f"  Train windows    : {len(train_ds):,} across {len(train_ds.hydrograph_ids)} hydrographs")
         if test_ds is not None:
@@ -311,7 +138,7 @@ def main() -> None:
     if is_ddp:
         model = DDP(model, device_ids=[device.index] if device.type == "cuda" else None)
 
-    lr = float(cfg.get("lr", 1e-4))
+    lr = float(cfg.get("lr", 3e-4))
     min_lr = float(cfg.get("min_lr", 1e-6))
     epochs = int(cfg.get("epochs", 150))
     max_steps = cfg.get("max_steps_per_epoch", None)
@@ -364,52 +191,40 @@ def main() -> None:
 
         model.train()
         t0 = time.perf_counter()
-        running: Dict[str, float] = {
-            "total_loss": 0.0,
-            "loss_one": 0.0,
-            "loss_stability": 0.0,
-            "physics_loss": 0.0,
-            "penalty_loss": 0.0,
-        }
+        running: Dict[str, float] = {"loss": 0.0, "loss_depth": 0.0, "loss_volume": 0.0}
         n_batches = 0
 
-        for step_idx, batch in enumerate(loader):
+        for step_idx, graph in enumerate(loader):
             if max_steps is not None and step_idx >= int(max_steps):
                 break
 
-            if isinstance(batch, tuple):
-                graph, phys = batch
-                graph = graph.to(device, non_blocking=True)
-                phys = {k: v.to(device, non_blocking=True) for k, v in phys.items()}
-            else:
-                graph, phys = batch.to(device, non_blocking=True), None
+            graph = graph.to(device, non_blocking=True)
+            assert graph.y is not None
 
             optimizer.zero_grad(set_to_none=True)
-            step_metrics = forward_backward_step(
-                model=model,
-                graph=graph,
-                physics_data=phys,
-                cfg=cfg,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
-                scaler=scaler,
-                is_ddp=is_ddp,
-            )
+            amp_ctx = autocast(device_type="cuda", dtype=amp_dtype) if use_amp else nullcontext()
+            with amp_ctx:
+                pred = model(graph.x, graph.edge_attr, graph)
+                loss_dict = compute_prediction_loss(pred, graph.y)
+                loss = loss_dict["loss"]
 
             if scaler is not None and scaler.is_enabled():
+                scaler.scale(loss).backward()
                 if grad_clip > 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                loss.backward()
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
 
             scheduler.step()
-            for k in running:
-                running[k] += step_metrics[k]
+            running["loss"] += float(loss.detach().item())
+            running["loss_depth"] += float(loss_dict["loss_depth"].detach().item())
+            running["loss_volume"] += float(loss_dict["loss_volume"].detach().item())
             n_batches += 1
 
         avg = {k: v / max(1, n_batches) for k, v in running.items()}
@@ -431,14 +246,13 @@ def main() -> None:
         if is_main:
             msg = (
                 f"Epoch {epoch + 1:03d}/{epochs:03d} ({dt_sec:.1f}s) | lr={cur_lr:.2e} | "
-                f"total={avg['total_loss']:.5f} (one={avg['loss_one']:.5f}, "
-                f"stab={avg['loss_stability']:.5f}, phys={avg['physics_loss']:.2e}, pen={avg['penalty_loss']:.2e})"
+                f"L_pred={avg['loss']:.5f} (depth={avg['loss_depth']:.5f}, vol={avg['loss_volume']:.5f})"
             )
             if val_metrics is not None:
                 msg += (
                     f" || Val Rollout RMSE={val_metrics['rmse_m']:.4f}m | "
                     f"NSE={val_metrics['nse']:.4f} | CSI@0.05={val_metrics['csi_0.05m']:.3f} | "
-                    f"CSI@0.30={val_metrics['csi_0.30m']:.3f}"
+                    f"CSI@0.30={val_metrics['csi_0.30m']:.3f} | VolErr={val_metrics['rel_total_vol_err_pct']:.1f}%"
                 )
             print(msg, flush=True)
 
@@ -458,7 +272,7 @@ def main() -> None:
             }
             torch.save(ckpt_payload, ckpt_dir / "latest.pt")
 
-            score = val_metrics["rmse_m"] if val_metrics is not None else avg["total_loss"]
+            score = val_metrics["rmse_m"] if val_metrics is not None else avg["loss"]
             if score < best_val_rmse:
                 best_val_rmse = score
                 ckpt_payload["best_val_rmse"] = best_val_rmse

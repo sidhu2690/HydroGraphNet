@@ -1,4 +1,4 @@
-# Budget Sample Verification Config (runs end-to-end on CPU or GPU in <1 minute)
+# Sample Verification Config (runs end-to-end on CPU in ~40s, or GPU in <3s)
 
 seed: 42
 
@@ -27,25 +27,20 @@ model:
   num_layers_node_decoder: 2
   mlp_activation_fn: silu
   aggregation: sum
-  do_concat_trick: false
+  do_concat_trick: true
   checkpoint_segments: 0
 
 batch_size: 2
-epochs: 3
-max_steps_per_epoch: 25
+epochs: 4
+max_steps_per_epoch: 45
 lr: 3.0e-4
 min_lr: 1.0e-5
 weight_decay: 1.0e-5
 scheduler: cosine
 grad_clip_norm: 1.0
-noise_type: pushforward
-noise_std: 0.01
-stability_loss_weight: 1.0
 
-use_physics_loss: true
-physics_loss_weight: 1.0
-use_penalty_loss: true
-penalty_loss_weight: 0.1
+noise_type: random_walk
+noise_std: 0.01
 
 device: auto
 amp: false
@@ -55,4 +50,4 @@ num_workers: 0
 ckpt_dir: ./checkpoints_sample
 output_dir: ./outputs_sample
 val_every_epochs: 1
-num_test_time_steps: 15
+num_test_time_steps: 62

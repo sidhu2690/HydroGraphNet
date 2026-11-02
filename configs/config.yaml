@@ -1,28 +1,25 @@
-# Full GPU Training Configuration — KAN-Free HydroGraphNet (White River M80)
-# Matches Taghizadeh et al. (2025) Table 2 with KAN replaced by LayerNorm-MLP.
+# Full-Scale GPU Training Configuration — White River (Zenodo 15491288)
+# Simplified KAN-Free MLP-MeshGraphNet trained purely with 1-step L_pred + random-walk noise.
 
 seed: 42
 
-# Dataset paths & windowing
 data_dir: ./data
 test_dir: ./data/Test
 prefix: M80
 train_ids_file: train.txt
 test_ids_file: test.txt
-num_training_samples: 500     # All 500 training hydrographs
-num_test_samples: 10          # Official 10 test hydrographs (T1..T10)
-n_time_steps: 2               # History window K=2 -> node input dim = 12 + 2*K = 16
-k_neighbors: 4                # k-NN spatial graph connectivity
-skip_initial_steps: 72        # Skip initial spin-up steps (official preprocessing)
-delta_t: 1200.0               # 20-minute physical step in seconds
+num_training_samples: 500
+num_test_samples: 10
+n_time_steps: 2
+k_neighbors: 4
+skip_initial_steps: 72
+delta_t: 1200.0
 
-# KAN-free MeshGraphNet architecture
-# (Set hidden_dim: 128, processor_size: 15 for the heavier PhysicsNeMo variant)
 model:
-  input_dim_nodes: 16
-  input_dim_edges: 3
-  output_dim: 2
-  hidden_dim: 64
+  input_dim_nodes: 16          # 10 static + 2 forcing + 2*n_time_steps
+  input_dim_edges: 3           # [dx, dy, distance]
+  output_dim: 2                # [delta_water_depth, delta_volume]
+  hidden_dim: 64               # Set 128 + processor_size: 15 to scale up on large GPUs
   processor_size: 5
   num_layers_node_encoder: 2
   num_layers_edge_encoder: 2
@@ -31,36 +28,28 @@ model:
   num_layers_node_decoder: 2
   mlp_activation_fn: silu
   aggregation: sum
-  do_concat_trick: false
+  do_concat_trick: true
   checkpoint_segments: 0
 
-# Training & stability settings
-batch_size: 4                 # Increase to 8-16 on 24GB+ GPUs
+batch_size: 8
 epochs: 150
-lr: 1.0e-4
+max_steps_per_epoch: null
+lr: 3.0e-4
 min_lr: 1.0e-6
 weight_decay: 1.0e-5
-scheduler: cosine             # Options: "cosine" or "exponential"
-lr_decay_rate: 0.9999979      # Used only if scheduler == "exponential"
+scheduler: cosine
 grad_clip_norm: 1.0
-noise_type: pushforward       # Options: "pushforward", "only_last", "random_walk", "none"
+
+# Pfaff et al. (2020) random-walk input noise with drift-corrected target increment
+noise_type: random_walk
 noise_std: 0.01
-stability_loss_weight: 1.0
 
-# Physics-informed losses
-use_physics_loss: true
-physics_loss_weight: 1.0
-use_penalty_loss: true
-penalty_loss_weight: 0.1
-
-# Runtime / GPU acceleration
-device: auto                  # "auto" selects cuda -> mps -> cpu
-amp: true                     # Automatic mixed precision (bf16/fp16 on CUDA)
-compile: false                # Set true on PyTorch 2.x + Linux GPU for ~25% speedup
+device: auto
+amp: true
+compile: false
 num_workers: 4
 
-# Checkpointing & validation rollout
 ckpt_dir: ./checkpoints
 output_dir: ./outputs
 val_every_epochs: 5
-num_test_time_steps: 30
+num_test_time_steps: 60
