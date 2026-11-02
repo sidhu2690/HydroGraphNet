@@ -1,4 +1,4 @@
-# HydroGraphNet-MLP (Lean, Pure-`L_pred` PyTorch Rewrite)
+# HydroGraphNet-MLP (Lean, PyTorch Rewrite)
 
 A clean, standalone, zero-bloat PyTorch rewrite of **HydroGraphNet** (*Taghizadeh et al., 2025*) for 2D flood forecasting on unstructured meshes, wired directly to the official **White River (`M80`)** benchmark (`Zenodo 15491288`).
 
