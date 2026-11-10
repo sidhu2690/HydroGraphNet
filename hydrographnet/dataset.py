@@ -5,7 +5,6 @@ Key improvements over ``NVIDIA/physicsnemo``'s ``HydroGraphDataset``:
      alignment (``[inflow[s+1], precip[s+1]]``) across both training and rollout.
   2. Standard Pfaff et al. (2020) random-walk input noise for rollout stability without
      expensive 2-step pushforward passes or auxiliary physics-dictionary overhead.
-  3. ~15x faster ASCII parsing via ``np.fromstring`` + automatic ``.cache_npz/`` caching.
 """
 
 from __future__ import annotations
@@ -28,7 +27,6 @@ DYNAMIC_NORM_STATS_FILE = "dynamic_norm_stats.json"
 
 
 def _fast_load_txt(path: Path) -> np.ndarray:
-    """Fast ASCII float table parser (~10-15x faster than ``np.loadtxt``)."""
     text = path.read_text()
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if not lines:
