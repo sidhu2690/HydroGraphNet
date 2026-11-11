@@ -118,19 +118,6 @@ hydrographnet/
 3. **Zero Dependency Hell**: Runs anywhere standard `torch` runs (single GPU, `torchrun` multi-GPU DDP, Apple MPS, or CPU).
 
 ---
-## 4. Experimental Findings: Why `L_phys` and `L_pen` Were Removed
-
-Controlled identical-seed (`seed=42`, identical initial weights and mini-batch sequence) ablations on the real White River mesh (`M80`, `4,787` nodes, `19,148` directed edges; `H1..H6` train, `T1..T3` unseen **62-step / 20.7-hour** full-event rollouts; raw data in `assets/ablation_results.json`) established four findings:
-
-1. **`L_phys` is redundant with `L_pred` (and conflicts with ground truth on heavy-rain steps)**:
-   - `L_pred` already supervises exact conservative HEC-RAS cell volume increments $\Delta V_{v,\text{GT}}$ at every node, whereas `L_phys` only penalizes the basin-wide scalar sum $\sum_v \hat{\Delta V}_v$ (giving every dry hilltop and deep channel cell the exact same uniform scalar gradient). When `L_phys` fires early in training, its parameter gradient has **`+0.94` to `+0.96` cosine similarity** with $\nabla_\theta L_{\text{pred}}$.
-   - Because open downstream outflow $Q_{\text{out}}(t) \ge 0$ is unmodeled in the inequality bound, `L_phys` has a median **dead-zone slack of `134,461 m³`** (`407,479 m³` at p90) where `ReLU == 0`.
-   - Conversely, on **`4.2%` (`16/384`)** of training windows, **exact HEC-RAS ground truth itself violates the paper's `L_phys` bound** because `infiltration_area_sum = sum(IP * A) / 100` ignores runoff from saturated pervious soils — causing $\nabla_\theta L_{\text{phys}}$ to fight ground truth (`cos = -0.78`) late in training.
-2. **`L_pen` ($\text{ReLU}(\hat{V}_v/A_v - \hat{h}_v)^2$) contributes `<0.04%` gradient norm**:
-   - Across training, $\|\nabla_\theta(0.1\,L_{\text{pen}})\|_2 / \|\nabla_\theta L_{\text{pred}}\|_2 \approx 10^{-4}\text{–}4\times 10^{-4}$, changing 20.7-hour rollout RMSE by `0.0001 m` (`0.1 mm`).
-3. **Pure `L_pred` passively drives both `L_phys` and `L_pen` down by 150×–250×**:
-   - Without ever backpropagating `L_phys` or `L_pen`, training on `L_pred` alone reduced passive `L_phys` from `6.12e-4` to `4.15e-6` and passive `0.1 * L_pen` from `2.44e-5` to `9.85e-8`.
----
 
 
 ## 4. Experimental Findings: Why `L_phys` and `L_pen` Were Removed
