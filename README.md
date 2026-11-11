@@ -110,7 +110,7 @@ hydrographnet/
 | **Graph Backend** | Requires `physicsnemo`, `dgl` / `torch_geometric` C++ extensions | **100% pure PyTorch** (`Tensor.index_add_`) |
 | **Boundary Forcing** | Off-by-one mismatch between training and rollout indexing | Consistent `s -> s+1` uses `[inflow[s+1], precip[s+1]]` everywhere |
 | **Test Metrics** | Reported z-scored normalized MSE | Denormalized physical **`RMSE (m)`**, **`MAE (m)`**, **`NSE`**, **`CSI@0.05m/0.30m`**, **`VolErr (%)`** |
-| **Data Loading** | `np.loadtxt` (~5s per ASCII table on every run) | `np.fromstring` + automatic `.cache_npz/` (~15× faster first load, `<1s` cached) |
+| **Data Loading** | `np.loadtxt` (~5s per ASCII table on every run) | `np.fromstring` + automatic `.cache_npz/` (`<1s` cached) |
 
 ### Practical Advantages
 1. **~3× Faster Training Steps & >50% Lower Peak GPU Memory**: Replacing 2-step pushforward (3 forward + 2 backward passes per batch) + physics reductions with 1-step `L_pred` + random-walk noise cuts per-step compute by ~3× and halves activation memory.
